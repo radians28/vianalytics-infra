@@ -1,0 +1,15 @@
+# Secrets
+.env
+
+# Runtime data (bind-mounted volumes)
+pgdata/
+uploads/
+caddy_data/
+caddy_config/
+
+# Local scratch
+.pnpm-store/
+Notes
+v
+*.tar.gz
+.DS_Store

@@ -1,0 +1,6 @@
+[submodule "vianalytics-svc"]
+	path = vianalytics-svc
+	url = https://github.com/radians28/vianalytics-svc.git
+[submodule "vianalytics-ui"]
+	path = vianalytics-ui
+	url = https://github.com/radians28/vianalytics-ui.git

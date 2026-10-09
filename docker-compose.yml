@@ -1,0 +1,154 @@
+# Production stack for a dedicated VPS.
+#
+#   https://app.your-domain.com        -> ui   (static React app)
+#   https://app.your-domain.com/api/*  -> svc  (Flask API)
+#   Postgres                           -> VPS loopback only (127.0.0.1:5432),
+#                                         reached through an SSH tunnel:
+#       ssh -N -L 5432:127.0.0.1:5432 user@app.your-domain.com
+#
+# Publicly exposed ports on the VPS: 80/tcp, 443/tcp+udp (Caddy), plus SSH.
+# ui and svc are only on internal Docker networks; db is bound to loopback.
+#
+# Cron deployment switch: set COMPOSE_PROFILES in .env
+#   COMPOSE_PROFILES=combined  -> one "svc" container runs API + cron together
+#   COMPOSE_PROFILES=split     -> "api" (scalable, multi-worker) + one standalone "cron"
+#
+#   docker compose up -d --build
+#   docker compose up -d --scale api=3      # split mode only
+
+x-svc: &svc
+  image: vianalytics-svc:latest
+  build: ./vianalytics-svc
+  restart: unless-stopped
+  volumes:
+    # svc runs as uid 10001; on Linux: sudo chown -R 10001:10001 ./uploads
+    - ./uploads:/data/uploads
+  depends_on:
+    db:
+      condition: service_healthy
+
+# Overrides that every svc variant shares (YAML merge is shallow, so each
+# service re-declares `environment` with this merged in)
+# All svc settings come from the root .env (see .env.example); the svc's own
+# .env is excluded from the image by .dockerignore.
+x-svc-env: &svc-env
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  CORS_ORIGINS: https://${DOMAIN}
+  # Required: the API refuses to start without it
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
+  # Matches the "uploads" volume mount below
+  UPLOAD_FOLDER: /data/uploads
+  CRON_TIMEZONE: ${CRON_TIMEZONE:-Asia/Jakarta}
+  TZ: Asia/Jakarta
+  # Seeded after migrations (skipped when SEED_ADMIN_PASSWORD is empty)
+  SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@admin.com}
+  SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+
+services:
+  # ---- public entry: TLS + routing ----
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+      CADDY_GLOBAL_OPTIONS: ${CADDY_GLOBAL_OPTIONS:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data       # certificates; keep this folder
+      - ./caddy_config:/config
+    networks: [edge]
+    depends_on:
+      - ui
+
+  ui:
+    image: vianalytics-ui:latest
+    build:
+      context: ./vianalytics-ui
+      args:
+        # Baked into the bundle at build time; "/api" is same-origin via Caddy.
+        # Rebuild the ui image after changing it.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    restart: unless-stopped
+    networks: [edge]
+
+  # ---- profile "combined": API + cron in a single container ----
+  svc:
+    <<: *svc
+    profiles: ["combined"]
+    environment:
+      <<: *svc-env
+      SVC_ROLE: all
+      RUN_MIGRATIONS: "1"
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+    networks:
+      edge:
+        aliases: [api]
+      backend: {}
+
+  # ---- profile "split": migrate once, then API (scalable) + standalone cron ----
+  migrate:
+    <<: *svc
+    profiles: ["split"]
+    restart: "no"
+    environment:
+      <<: *svc-env
+      SVC_ROLE: migrate
+    networks: [backend]
+
+  api:
+    <<: *svc
+    profiles: ["split"]
+    environment:
+      <<: *svc-env
+      SVC_ROLE: api
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+    networks: [edge, backend]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  cron:
+    <<: *svc
+    profiles: ["split"]
+    environment:
+      <<: *svc-env
+      SVC_ROLE: cron
+    networks: [backend]
+    deploy:
+      replicas: 1   # never scale: each replica would run every job again
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # ---- database: bound to the VPS's loopback, never a public interface ----
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: Asia/Jakarta
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    ports:
+      # 127.0.0.1 only: reachable from the VPS itself (and so through an SSH
+      # tunnel), not from the internet. Don't drop the 127.0.0.1 prefix.
+      - "127.0.0.1:${DB_TUNNEL_PORT:-5432}:5432"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  # Caddy <-> ui / api
+  edge: {}
+  # api / cron <-> db
+  backend: {}

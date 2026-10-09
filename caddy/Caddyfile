@@ -1,0 +1,43 @@
+# Public entry point. Caddy obtains and renews the TLS certificate for
+# {$DOMAIN} automatically (ports 80 and 443 must be reachable).
+{
+	email {$ACME_EMAIL}
+	# Local runs: CADDY_GLOBAL_OPTIONS=local_certs issues certificates from
+	# Caddy's own CA instead of Let's Encrypt. Leave empty in production.
+	{$CADDY_GLOBAL_OPTIONS}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# https://{$DOMAIN}/api/* -> svc (API server)
+	handle /api/* {
+		request_body {
+			max_size 50MB # matches the svc's MAX_CONTENT_LENGTH
+		}
+		reverse_proxy {
+			# Resolve every "api" container on each refresh, so scaling the
+			# API (split mode) is picked up without restarting Caddy.
+			dynamic a {
+				name api
+				port 3000
+				refresh 10s
+			}
+			lb_policy round_robin
+			lb_try_duration 5s
+		}
+	}
+
+	# Everything else -> UI
+	handle {
+		reverse_proxy ui:8080
+	}
+}
