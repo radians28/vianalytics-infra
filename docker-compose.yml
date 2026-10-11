@@ -12,6 +12,11 @@
 #
 #   docker compose up -d --build
 #   docker compose up -d --scale api=3
+#
+# Database: install a new one or use an existing Postgres (set in .env)
+#   new      COMPOSE_PROFILES=local-db  DB_HOST=db  -> starts the "db" service below
+#   existing COMPOSE_PROFILES=          DB_HOST=<existing host>  -> "db" is not started;
+#            every service connects to DB_HOST:DB_PORT (see "Database" in .env.example)
 
 x-svc: &svc
   image: vianalytics-svc:latest
@@ -20,16 +25,21 @@ x-svc: &svc
   volumes:
     # svc runs as uid 10001; on Linux: sudo chown -R 10001:10001 ./uploads
     - ./uploads:/data/uploads
+  # Lets DB_HOST=host.docker.internal reach a Postgres published on the Docker host
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   depends_on:
     db:
       condition: service_healthy
+      # Only waited for when the local-db profile is active (new database)
+      required: false
 
 # Overrides that every svc variant shares (YAML merge is shallow, so each
 # service re-declares `environment` with this merged in)
 # All svc settings come from the root .env (see .env.example); the svc's own
 # .env is excluded from the image by .dockerignore.
 x-svc-env: &svc-env
-  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST:-db}:${DB_PORT:-5432}/${POSTGRES_DB}
   CORS_ORIGINS: https://${DOMAIN}
   # Required: the API refuses to start without it
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
@@ -49,6 +59,8 @@ x-airflow: &airflow
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   depends_on:
     airflow-init:
       condition: service_completed_successfully
@@ -62,8 +74,8 @@ x-airflow-env: &airflow-env
   AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
   AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
   AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-  # Airflow's own metadata lives in a separate "airflow" database on db
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/airflow
+  # Airflow's own metadata lives in a separate database on the same server
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST:-db}:${DB_PORT:-5432}/${AIRFLOW_DB_NAME:-airflow}
   # Served under https://DOMAIN/airflow (Caddy forwards the path unchanged)
   AIRFLOW__API__BASE_URL: https://${DOMAIN}/airflow
   AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY:?set AIRFLOW_SECRET_KEY in .env}
@@ -71,7 +83,7 @@ x-airflow-env: &airflow-env
   # Task runners report back to the api-server over the internal network
   AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/airflow/execution/
   # Connection "vianalytics_db" used by the DAGs to write to the app database
-  AIRFLOW_CONN_VIANALYTICS_DB: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  AIRFLOW_CONN_VIANALYTICS_DB: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST:-db}:${DB_PORT:-5432}/${POSTGRES_DB}
 
 services:
   # ---- public entry: TLS + routing ----
@@ -112,7 +124,7 @@ services:
     environment:
       <<: *svc-env
       SVC_ROLE: migrate
-    networks: [backend]
+    networks: [backend, dbnet]
 
   api:
     <<: *svc
@@ -120,7 +132,7 @@ services:
       <<: *svc-env
       SVC_ROLE: api
       GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
-    networks: [edge, backend]
+    networks: [edge, backend, dbnet]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -139,16 +151,28 @@ services:
         mkdir -p /opt/airflow/logs
         chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
         python - <<'EOF'
-        import os, psycopg2
-        conn = psycopg2.connect(host="db", user=os.environ["POSTGRES_USER"],
-                                password=os.environ["POSTGRES_PASSWORD"],
-                                dbname=os.environ["POSTGRES_DB"])
+        import os, sys, psycopg2
+        from psycopg2 import sql
+        name = os.environ["AIRFLOW_DB_NAME"]
+        try:
+            conn = psycopg2.connect(host=os.environ["DB_HOST"], port=os.environ["DB_PORT"],
+                                    user=os.environ["POSTGRES_USER"],
+                                    password=os.environ["POSTGRES_PASSWORD"],
+                                    dbname=os.environ["POSTGRES_DB"], connect_timeout=10)
+        except psycopg2.OperationalError as e:
+            sys.exit("Cannot reach Postgres at %s:%s (check DB_HOST / DB_PORT / credentials): %s"
+                     % (os.environ["DB_HOST"], os.environ["DB_PORT"], e))
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM pg_database WHERE datname = 'airflow'")
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,))
             if not cur.fetchone():
-                cur.execute("CREATE DATABASE airflow")
-                print("Created database 'airflow'")
+                try:
+                    cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+                    print("Created database '%s'" % name)
+                except psycopg2.errors.InsufficientPrivilege:
+                    sys.exit("User %s may not create databases. On the existing server run "
+                             "CREATE DATABASE %s OWNER %s; (or GRANT CREATEDB) and retry."
+                             % (os.environ["POSTGRES_USER"], name, os.environ["POSTGRES_USER"]))
         EOF
         exec /entrypoint airflow version
     environment:
@@ -156,20 +180,24 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
+      AIRFLOW_DB_NAME: ${AIRFLOW_DB_NAME:-airflow}
       _AIRFLOW_DB_MIGRATE: "true"
       _AIRFLOW_WWW_USER_CREATE: "true"
       _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
       _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
-    networks: [backend]
+    networks: [backend, dbnet]
     depends_on:
       db:
         condition: service_healthy
+        required: false
 
   airflow-apiserver:
     <<: *airflow
     command: api-server
     environment: *airflow-env
-    networks: [edge, backend]
+    networks: [edge, backend, dbnet]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/airflow/api/v2/version"]
       interval: 30s
@@ -181,17 +209,20 @@ services:
     <<: *airflow
     command: scheduler
     environment: *airflow-env
-    networks: [backend]
+    networks: [backend, dbnet]
 
   airflow-dag-processor:
     <<: *airflow
     command: dag-processor
     environment: *airflow-env
-    networks: [backend]
+    networks: [backend, dbnet]
 
   # ---- database: bound to the VPS's loopback, never a public interface ----
+  # Started only with the "local-db" profile (COMPOSE_PROFILES=local-db in .env).
+  # Leave the profile off to use an existing Postgres via DB_HOST / DB_PORT.
   db:
     image: postgres:16-alpine
+    profiles: [local-db]
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -214,5 +245,11 @@ services:
 networks:
   # Caddy <-> ui / api / airflow-apiserver
   edge: {}
-  # api / airflow <-> db
+  # api / airflow <-> db (local-db profile)
   backend: {}
+  # api / airflow <-> an existing Postgres container on the same Docker host.
+  # Existing DB: DB_NETWORK=<network the Postgres container is attached to>,
+  # DB_NETWORK_EXTERNAL=true. New DB: leave the defaults (an unused local network).
+  dbnet:
+    name: ${DB_NETWORK:-vianalytics_dbnet}
+    external: ${DB_NETWORK_EXTERNAL:-false}
