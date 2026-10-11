@@ -13,3 +13,7 @@ Notes
 v
 *.tar.gz
 .DS_Store
+
+# Airflow task logs
+airflow/logs/
+__pycache__/
