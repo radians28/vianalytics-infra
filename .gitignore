@@ -16,3 +16,4 @@ v
 
 # Airflow task logs
 airflow/logs/
+__pycache__/
