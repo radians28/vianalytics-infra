@@ -13,6 +13,7 @@ Notes
 v
 *.tar.gz
 .DS_Store
+.venv
 
 # Airflow task logs
 airflow/logs/
