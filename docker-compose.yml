@@ -52,7 +52,12 @@ x-svc-env: &svc-env
 
 # Shared by every Airflow component
 x-airflow: &airflow
-  image: apache/airflow:${AIRFLOW_VERSION:-3.3.2}
+  image: vianalytics-airflow:${AIRFLOW_VERSION:-3.3.2}
+  build:
+    context: ./airflow
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION:-3.3.2}
+      PYTHON_VERSION: ${AIRFLOW_PYTHON_VERSION:-3.13}
   restart: unless-stopped
   # On Linux set AIRFLOW_UID=$(id -u) in .env so ./airflow/logs is writable
   user: "${AIRFLOW_UID:-50000}:0"

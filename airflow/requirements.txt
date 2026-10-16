@@ -1,0 +1,5 @@
+# Extra Python packages for the Airflow DAGs (installed on top of the base image).
+# Already included in the base image: apache-airflow-providers-postgres, psycopg2, pendulum.
+# Edit, then rebuild: docker compose build airflow-init && docker compose up -d
+pandas
+openpyxl
