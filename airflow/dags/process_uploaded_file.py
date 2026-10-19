@@ -3,11 +3,10 @@ from datetime import datetime
 from typing import Any
 
 
-from airflow.exceptions import AirflowFailException
+from airflow.sdk.exceptions import AirflowFailException
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sdk import dag, task, get_current_context
-from psycopg2.extras import RealDictCursor
 
 @dag(
     dag_id="api_triggered_dag",
@@ -33,7 +32,10 @@ def trigger_file_to_staging():
             raise ValueError('Invalid upload_id format')
 
         hook = PostgresHook(postgres_conn_id="vianalytics_db")
-        with closing(hook.get_conn()) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # The postgres provider may hand back a psycopg2 or a psycopg 3
+        # connection, so rows are mapped to dicts by hand instead of using a
+        # driver-specific cursor/row factory
+        with closing(hook.get_conn()) as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT
                     upload_id,
@@ -45,9 +47,10 @@ def trigger_file_to_staging():
                 WHERE upload_id = %(upload_id)s
             """, { 'upload_id': upload_id })
             row = cur.fetchone()
+            columns = [col[0] for col in cur.description]
         if row is None:
             raise Exception(f'Queue {upload_id} does not exist')
-        return row
+        return dict(zip(columns, row))
 
     @task.branch
     def choose_channel_processor(channel: str) -> str:

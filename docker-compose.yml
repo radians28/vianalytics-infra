@@ -45,6 +45,10 @@ x-svc-env: &svc-env
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
   # Matches the "uploads" volume mount below
   UPLOAD_FOLDER: /data/uploads
+  # Uploads start the "api_triggered_dag" run through the internal api-server
+  AIRFLOW_API_URL: http://airflow-apiserver:8080/airflow
+  AIRFLOW_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+  AIRFLOW_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
   TZ: Asia/Jakarta
   # Seeded after migrations (skipped when SEED_ADMIN_PASSWORD is empty)
   SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@admin.com}
@@ -64,6 +68,8 @@ x-airflow: &airflow
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
+    # Shared with the svc: DAGs read uploads from upload_progress.file_path
+    - ./uploads:/data/uploads
   extra_hosts:
     - "host.docker.internal:host-gateway"
   depends_on:
