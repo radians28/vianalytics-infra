@@ -86,7 +86,8 @@ def trigger_file_to_staging():
 
     @task
     def process_stg_shopee(upload: dict) -> dict:
-        return upload
+        from staging import shopee
+        return shopee.load(upload)
 
     @task
     def process_stg_lazada(upload: dict) -> dict:
