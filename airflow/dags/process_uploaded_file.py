@@ -36,18 +36,25 @@ def trigger_file_to_staging():
         # connection, so rows are mapped to dicts by hand instead of using a
         # driver-specific cursor/row factory
         with closing(hook.get_conn()) as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    upload_id,
-                    file_name,
-                    file_path,
-                    channel,
-                    status
-                FROM upload_progress
-                WHERE upload_id = %(upload_id)s
-            """, { 'upload_id': upload_id })
-            row = cur.fetchone()
-            columns = [col[0] for col in cur.description]
+            try:
+                cur.execute("""
+                    UPDATE upload_progress
+                    SET status = 'Processing',
+                        processed_at = NOW()
+                    WHERE upload_id = %(upload_id)s
+                    RETURNING
+                        upload_id,
+                        file_name,
+                        file_path,
+                        channel,
+                        status
+                """, { 'upload_id': upload_id })
+                row = cur.fetchone()
+                columns = [col[0] for col in cur.description]
+                conn.commit()
+            except Exception:
+                conn.rollback() # pyright: ignore[reportAttributeAccessIssue]
+                raise Exception(f'Failed to process the query record for {upload_id}')
         if row is None:
             raise Exception(f'Queue {upload_id} does not exist')
         return dict(zip(columns, row))
@@ -74,7 +81,8 @@ def trigger_file_to_staging():
     """
     @task
     def process_stg_tiktok_tokped(upload: dict) -> dict:
-        return upload
+        from staging import tiktok_tokped
+        return tiktok_tokped.load(upload)
 
     @task
     def process_stg_shopee(upload: dict) -> dict:

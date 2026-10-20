@@ -3,3 +3,5 @@
 # Edit, then rebuild: docker compose build airflow-init && docker compose up -d
 pandas
 openpyxl
+# Streams xlsx/xls uploads; TikTok/Tokopedia exports break openpyxl
+python-calamine
