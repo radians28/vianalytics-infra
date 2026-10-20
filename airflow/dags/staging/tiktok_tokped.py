@@ -16,7 +16,8 @@ from staging.common import (
     cell_text,
     finish_load_run,
     insert_sql,
-    iter_file_rows,
+    open_source,
+    PrecisionLossError,
     log_step,
     mark_failed,
     mark_processing,
@@ -32,6 +33,10 @@ log = logging.getLogger(__name__)
 # Purchase Channel value (lower case) -> staging table
 TABLES = {'tiktok': 'stg_tiktok', 'tokopedia': 'stg_tokopedia'}
 ORDER_ID = re.compile(r'\d+')
+# An ID a spreadsheet turned into a number before the CSV was saved: 5.82837E+17
+SCIENTIFIC_ID = re.compile(r'\d+(\.\d+)?E\+?\d+', re.I)
+# Sheet of the OrderSKUList export; other sheets in a re-saved workbook are ignored
+SHEET_NAME = 'OrderSKUList'
 
 
 def load(upload: dict, conn_id: str = 'vianalytics_db') -> dict:
@@ -48,15 +53,16 @@ def load(upload: dict, conn_id: str = 'vianalytics_db') -> dict:
             mark_processing(status_cur, upload['upload_id'], total_rows=None)
             run_id = None
             try:
-                total_height, rows = iter_file_rows(upload['file_path'])
-                if total_height is not None:
+                source = open_source(upload['file_path'], sheet_names=(SHEET_NAME,))
+                log.info('upload %s: reading %s file', upload['upload_id'], source.format)
+                if source.total_rows is not None:
                     # every row after the header, so processed_rows ends equal to it
-                    set_total_rows(status_cur, upload['upload_id'], max(total_height - 1, 0))
+                    set_total_rows(status_cur, upload['upload_id'], max(source.total_rows - 1, 0))
 
                 run_id = start_load_run(cur, upload, list(TABLES.values()))
                 data_conn.commit()      # keep the run row even if the data rolls back
 
-                counts = _insert_rows(cur, status_cur, upload, rows, run_id)
+                counts = _insert_rows(cur, status_cur, upload, source.rows, run_id)
                 for seq, (key, table) in enumerate(TABLES.items(), start=1):
                     log_step(cur, run_id, seq, 'load_stg', key.upper(), table,
                              rows_read=counts['read'],
@@ -83,7 +89,7 @@ def load(upload: dict, conn_id: str = 'vianalytics_db') -> dict:
 
 
 def _insert_rows(cur, status_cur, upload: dict, rows, run_id: int) -> dict:
-    header = [snake(h) for h in next(rows, [])]
+    header = [snake(h) if h is not None else '' for h in next(rows, [])]
     if 'order_id' not in header or 'purchase_channel' not in header:
         raise ValueError('Not a TikTok/Tokopedia order export: missing Order ID or Purchase Channel column')
 
@@ -115,13 +121,22 @@ def _insert_rows(cur, status_cur, upload: dict, rows, run_id: int) -> dict:
             counts['inserted'][table] += len(buffer)
             buffer.clear()
 
-    for row_no, row in enumerate(rows, start=2):        # excel row number (header = 1)
+    for row_no, row in enumerate(rows, start=2):        # file row number (header = 1)
         counts['read'] += 1
-        order_id = cell_text(row[order_idx]) if order_idx < len(row) else None
+        try:
+            values = [cell_text(v) for v in row]
+        except PrecisionLossError as err:
+            raise PrecisionLossError(f'Row {row_no}: {err}') from None
+        order_id = values[order_idx] if order_idx < len(values) else None
+        if order_id and SCIENTIFIC_ID.fullmatch(order_id):
+            raise PrecisionLossError(
+                f'Row {row_no}: Order ID {order_id} was saved in scientific notation and has '
+                'lost digits; format the ID columns as Text before saving the CSV'
+            )
         if not order_id or not ORDER_ID.fullmatch(order_id):
             counts['rejected'] += 1                      # description / blank rows
             continue
-        channel = (cell_text(row[channel_idx]) or '').lower() if channel_idx < len(row) else ''
+        channel = (values[channel_idx] or '').lower() if channel_idx < len(values) else ''
         table = TABLES.get(channel)
         if table is None:
             counts['rejected'] += 1
@@ -129,7 +144,7 @@ def _insert_rows(cur, status_cur, upload: dict, rows, run_id: int) -> dict:
             continue
 
         _, positions, buffer = plans[table]
-        buffer.append([cell_text(row[i]) if i is not None and i < len(row) else None
+        buffer.append([values[i] if i is not None and i < len(values) else None
                        for i in positions] + [upload['file_name'], row_no, run_id])
         if len(buffer) >= BATCH_SIZE:
             flush(table)
