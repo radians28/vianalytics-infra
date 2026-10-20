@@ -90,7 +90,8 @@ def trigger_file_to_staging():
 
     @task
     def process_stg_lazada(upload: dict) -> dict:
-        return upload
+        from staging import lazada
+        return lazada.load(upload)
 
     @task
     def process_stg_blibli(upload: dict) -> dict:
