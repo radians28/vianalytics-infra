@@ -1,8 +1,9 @@
 """Shared pieces for loading an uploaded marketplace export into royal_canin.stg_*.
 
 Staging columns are text, as-is from the file (see ddl_royal_canin.sql). Every
-load is one royal_canin.log_etl_run row; stg rows carry its run_id in
-load_run_id, so a retried upload can drop what an earlier attempt inserted.
+load is one royal_canin.log_etl_run row linked to its upload_progress row by
+upload_id; stg rows carry its run_id in load_run_id, so a retried upload can
+drop what an earlier attempt inserted.
 """
 import codecs
 import csv
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 SCHEMA = 'royal_canin'
+# log_etl_run.triggered_by for loads started by a file upload
+TRIGGERED_BY = 'upload'
 BATCH_SIZE = 1000
 
 XLSX_SIGNATURE = b'PK\x03\x04'                          # zip container
@@ -156,10 +159,9 @@ def insert_sql(table: str, columns: list[str]) -> str:
 def start_load_run(cur, upload: dict, tables: list[str]) -> int:
     """Open a log_etl_run for this attempt and drop rows from earlier attempts
     of the same upload (Airflow retries), so the load stays idempotent."""
-    triggered_by = f"upload:{upload['upload_id']}"
     cur.execute(f"""
-        SELECT run_id FROM {SCHEMA}.log_etl_run WHERE triggered_by = %(triggered_by)s
-    """, {'triggered_by': triggered_by})
+        SELECT run_id FROM {SCHEMA}.log_etl_run WHERE upload_id = %(upload_id)s
+    """, {'upload_id': upload['upload_id']})
     previous = [row[0] for row in cur.fetchall()]
     if previous:
         for table in tables:
@@ -175,11 +177,11 @@ def start_load_run(cur, upload: dict, tables: list[str]) -> int:
         """, {'runs': previous})
 
     cur.execute(f"""
-        INSERT INTO {SCHEMA}.log_etl_run (status, channels, source_files, triggered_by)
-        VALUES ('RUNNING', %(channel)s, %(file_path)s, %(triggered_by)s)
+        INSERT INTO {SCHEMA}.log_etl_run (status, channels, source_files, triggered_by, upload_id)
+        VALUES ('RUNNING', %(channel)s, %(file_path)s, %(triggered_by)s, %(upload_id)s)
         RETURNING run_id
     """, {'channel': upload['channel'], 'file_path': upload['file_path'],
-          'triggered_by': triggered_by})
+          'triggered_by': TRIGGERED_BY, 'upload_id': upload['upload_id']})
     return cur.fetchone()[0]
 
 
