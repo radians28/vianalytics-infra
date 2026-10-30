@@ -95,7 +95,8 @@ def trigger_file_to_staging():
 
     @task
     def process_stg_blibli(upload: dict) -> dict:
-        return upload
+        from staging import blibli
+        return blibli.load(upload)
 
     """
         TODO
