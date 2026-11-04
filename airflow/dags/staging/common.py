@@ -230,6 +230,28 @@ def report_progress(cur, upload_id: str, processed_rows: int):
     """, {'upload_id': upload_id, 'processed_rows': processed_rows})
 
 
+def fail_upload(context, conn_id: str = 'vianalytics_db'):
+    """on_failure_callback: Airflow calls it once a task's last retry has failed (not on the retries
+    before it), so upload_progress only turns 'Failed' when the pipeline has really given up."""
+    import logging
+    from contextlib import closing
+
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    dag_run = context.get('dag_run')
+    upload_id = ((dag_run.conf if dag_run else None) or {}).get('upload_id')
+    if not upload_id:
+        logging.getLogger(__name__).warning('fail_upload: no upload_id in the DAG run conf')
+        return
+    ti = context.get('ti')
+    task = ti.task_id if ti else 'task'
+    error = f'{task}: {context.get("exception") or "failed"}'
+    hook = PostgresHook(postgres_conn_id=conn_id)
+    with closing(hook.get_conn()) as conn, conn.cursor() as cur:
+        mark_failed(cur, str(upload_id), error)
+        conn.commit()
+
+
 def mark_failed(cur, upload_id: str, error: str):
     cur.execute("""
         UPDATE upload_progress

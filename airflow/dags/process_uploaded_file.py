@@ -8,6 +8,8 @@ from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOpe
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sdk import dag, task, get_current_context
 
+from staging.common import fail_upload
+
 @dag(
     dag_id="api_triggered_dag",
     schedule=None,              # on-demand only, triggered by the API
@@ -15,7 +17,8 @@ from airflow.sdk import dag, task, get_current_context
     catchup=False,
     max_active_runs=10,         # limit concurrent requests
     tags=["api", "on-demand"],
-    default_args={"retries": 2},
+    # upload_progress -> 'Failed' only once a task has used up its retries
+    default_args={"retries": 2, "on_failure_callback": fail_upload},
 )
 def trigger_file_to_staging():
     @task
@@ -100,8 +103,7 @@ def trigger_file_to_staging():
         return blibli.load(upload)
 
     """
-        TODO
-        process_sku_{channel} step by step
+        process_sku_{channel} (sku/process.py) step by step
         1. Create postgreSQL connection and stream read from stg channel in chunk/paginated, 
            only select record related to master data SKU -> reduce memory bottleneck
         2. Check if the SKU keyset has been seen in this process, skip it (SKU consolidation only 
@@ -115,22 +117,30 @@ def trigger_file_to_staging():
            b. 3a doesn't exist but 3b exists, SKU has been updated to new one/this record is the old one
               insert to SKU history and update SKU master metadata based on timeline (compare the order date and SKU seller effective date)
         5. If both of them doesn't exist, process either as new SKU record or map to existing one (based on proposed process)
+           -> product name compared with the SKU master names; a close match is saved in
+              royal_canin.log_sku_match as PENDING; the DAG goes on and handle_order_dag_{channel}
+              skips those lines and ends the upload as Paused (SKU sanitize modal / pending-SKU pipeline),
+              no close match becomes a new SKU (log_sku_match CREATED_NEW, resolved_by 'auto')
     """
     @task
     def process_sku_tiktok_tokped(upload: dict) -> dict:
-        return upload
+        from sku import process
+        return process.run(upload)
 
     @task
     def process_sku_shopee(upload: dict) -> dict:
-        return upload
+        from sku import process
+        return process.run(upload)
     
     @task
     def process_sku_lazada(upload: dict) -> dict:
-        return upload
+        from sku import process
+        return process.run(upload)
     
     @task
     def process_sku_blibli(upload: dict) -> dict:
-        return upload
+        from sku import process
+        return process.run(upload)
 
     upload_file: dict[str, Any] = get_run_data() # pyright: ignore[reportAssignmentType]
     channel = upload_file['channel']

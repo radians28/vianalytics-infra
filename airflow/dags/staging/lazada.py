@@ -18,7 +18,6 @@ from staging.common import (
     open_source,
     PrecisionLossError,
     log_step,
-    mark_failed,
     mark_processing,
     report_progress,
     set_total_rows,
@@ -80,7 +79,6 @@ def load(upload: dict, conn_id: str = 'vianalytics_db') -> dict:
                 data_conn.rollback()  # pyright: ignore[reportAttributeAccessIssue]
                 if run_id is not None:
                     finish_load_run(status_cur, run_id, error=str(err))
-                mark_failed(status_cur, upload['upload_id'], str(err))
                 raise
             report_progress(status_cur, upload['upload_id'], counts['read'])
 

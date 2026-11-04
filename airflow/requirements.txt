@@ -5,3 +5,5 @@ pandas
 openpyxl
 # Streams xlsx/xls uploads; TikTok/Tokopedia exports break openpyxl
 python-calamine
+# Product-name similarity for unknown SKUs (sku/matcher.py, TF-IDF)
+scikit-learn
