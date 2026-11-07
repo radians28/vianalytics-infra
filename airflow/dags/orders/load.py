@@ -6,7 +6,10 @@ Port of vianalytics-svc/sku_consolidation/common/tx.py (offline step 6), reading
    are rejected
 3. each line is resolved to the SKU master: cleaned seller SKU via m_sku_alias / m_sku_history,
    else the listing (m_platform_sku). Lines that still have no SKU belong to listings waiting in
-   log_sku_match (PENDING); they are skipped here and loaded by the pending-SKU pipeline
+   log_sku_match (PENDING); they are skipped here. Once an admin resolves them through the SKU review
+   API, handle_continue_order_data_{channel} (run_continue) loads ONLY those listings' lines: lines
+   already written (including auto CREATED_NEW listings) and existing headers are never rewritten,
+   a mixed order's header only gets item_line_count / total_quantity recounted
 4. a bundle line (sku_id in m_sku_bundle) becomes one line per component, one level only (a component
    that is a bundle itself stays that bundle SKU): quantity x component qty, gmv_1 and discounts
    split by price_ratio, rounding remainder on the last component, line_key '<key>#<component_seq>'
@@ -41,30 +44,80 @@ CHUNK = 5000
 
 def run(upload: dict, conn_id: str = 'vianalytics_db') -> dict:
     """Load the orders of one uploaded file (all its channels); returns the upload with counts."""
-    upload_id, channel = upload.get('upload_id'), upload.get('channel')
-    if not upload_id:
-        raise ValueError('Missing upload_id in the DAG run conf')
-    if channel not in SOURCES:
-        raise ValueError(f'Unsupported channel: {channel!r}')
+    upload_id, channel = _check_conf(upload)
+    hook = PostgresHook(postgres_conn_id=conn_id)
+    results = {}
+    with closing(hook.get_conn()) as conn:
+        run_id, channels = _start(conn, upload_id, channel)
+        for code, table in SOURCES[channel]:
+            results[code] = load_channel(conn, code, table, run_id, *channels[code])
+            log.info('%s: %s', code, results[code])
+    return {**upload, 'load_run_id': run_id, 'orders': results}
+
+
+def run_continue(conf: dict, conn_id: str = 'vianalytics_db') -> dict:
+    """handle_continue_order_data_{channel}: load ONLY the order lines of the listings an admin resolved
+    through the SKU review API (log_sku_match rows of conf['match_ids']).
+
+    Lines the first load already wrote are never touched: auto CREATED_NEW listings, PENDING rows and
+    every other listing of the upload are ignored, and existing order headers are kept as they are
+    (only their item_line_count / total_quantity are recounted)."""
+    upload_id, channel = _check_conf(conf)
+    match_ids = sorted({int(i) for i in conf.get('match_ids') or []})
+    if not match_ids:
+        raise ValueError('Missing match_ids in the DAG run conf')
 
     hook = PostgresHook(postgres_conn_id=conn_id)
     results = {}
     with closing(hook.get_conn()) as conn:
+        run_id, channels = _start(conn, upload_id, channel)
         with conn.cursor() as cur:
-            run_id = staging_run_id(cur, upload_id)
-            cur.execute("""
-                UPDATE upload_progress SET last_heartbeat = now(), updated_at = now()
-                WHERE upload_id = %s
-            """, (upload_id,))
-            cur.execute(f'SELECT channel_code, channel_id, gmv2_dedup_by_order FROM {SCHEMA}.m_channel')
-            channels = {code: (cid, dedup) for code, cid, dedup in cur.fetchall()}
+            cur.execute(f"""
+                SELECT match_id, channel_id, merchant_sku, coalesce(sku_code, '') FROM {SCHEMA}.log_sku_match
+                WHERE match_id = ANY(%s::bigint[]) AND upload_id = %s
+                  AND status IN ('MAPPED', 'CREATED_NEW') AND resolved_by IS DISTINCT FROM 'auto'
+            """, (match_ids, upload_id))
+            rows = cur.fetchall()
         conn.commit()
+        ignored = sorted(set(match_ids) - {r[0] for r in rows})
+        if ignored:
+            log.warning('match ids ignored (not this upload, still PENDING or resolved automatically): %s', ignored)
+        if not rows:
+            raise RuntimeError(f'No manually resolved SKU among match_ids {match_ids} of upload {upload_id}')
         for code, table in SOURCES[channel]:
-            if code not in channels:
-                raise RuntimeError(f'Channel {code} missing from {SCHEMA}.m_channel')
-            results[code] = load_channel(conn, code, table, run_id, *channels[code])
-            log.info('%s: %s', code, results[code])
-    return {**upload, 'load_run_id': run_id, 'orders': results}
+            channel_id = channels[code][0]
+            only = {(m, s) for _, cid, m, s in rows if cid == channel_id}
+            if only:
+                results[code] = load_channel(conn, code, table, run_id, *channels[code], only=only)
+                log.info('%s: %s', code, results[code])
+    return {**conf, 'load_run_id': run_id, 'match_ids': match_ids, 'ignored_match_ids': ignored,
+            'orders': results}
+
+
+def _check_conf(conf: dict) -> tuple[str, str]:
+    upload_id, channel = conf.get('upload_id'), conf.get('channel')
+    if not upload_id:
+        raise ValueError('Missing upload_id in the DAG run conf')
+    if channel not in SOURCES:
+        raise ValueError(f'Unsupported channel: {channel!r}')
+    return upload_id, channel
+
+
+def _start(conn, upload_id: str, channel: str) -> tuple[int, dict]:
+    """The upload's staging run id, a heartbeat, and code -> (channel_id, gmv2_dedup) of its channels."""
+    with conn.cursor() as cur:
+        run_id = staging_run_id(cur, upload_id)
+        cur.execute("""
+            UPDATE upload_progress SET last_heartbeat = now(), updated_at = now()
+            WHERE upload_id = %s
+        """, (upload_id,))
+        cur.execute(f'SELECT channel_code, channel_id, gmv2_dedup_by_order FROM {SCHEMA}.m_channel')
+        channels = {code: (cid, dedup) for code, cid, dedup in cur.fetchall()}
+    conn.commit()
+    for code, _ in SOURCES[channel]:
+        if code not in channels:
+            raise RuntimeError(f'Channel {code} missing from {SCHEMA}.m_channel')
+    return run_id, channels
 
 
 def staging_run_id(cur, upload_id: str) -> int:
@@ -81,12 +134,20 @@ def staging_run_id(cur, upload_id: str) -> int:
 
 # ---------------------------------------------------------------- per channel
 
-def load_channel(conn, code: str, table: str, run_id: int, channel_id: int, gmv2_dedup: bool) -> dict:
+def load_channel(conn, code: str, table: str, run_id: int, channel_id: int, gmv2_dedup: bool,
+                 only: set | None = None) -> dict:
+    """Load one channel's lines. `only` = {(merchant_sku, sku_code)} of manually resolved listings:
+    then just their lines are written and existing headers are kept (run_continue)."""
+    step = 'load_orders' if only is None else 'continue_orders'
     raw = read_stg(conn, code, table, run_id)
     counts = {'lines': len(raw), 'rejected': 0, 'duplicate_lines': 0, 'skipped_pending_lines': 0,
               'skipped_pending_orders': 0, 'bundle_lines': 0, 'orders': 0, 'detail_rows': 0}
+    if only is not None:
+        counts = {'lines': len(raw), 'rejected': 0, 'duplicate_lines': 0, 'target_lines': 0,
+                  'ignored_lines': 0, 'bundle_lines': 0, 'orders': 0, 'orders_new': 0,
+                  'orders_existing': 0, 'detail_rows': 0}
     if raw.empty:
-        _log(conn, run_id, code, counts)
+        _log(conn, run_id, code, counts, step)
         return counts
 
     lines = nz.normalize(raw, code)
@@ -103,10 +164,22 @@ def load_channel(conn, code: str, table: str, run_id: int, channel_id: int, gmv2
     conn.commit()
     lines = ms.resolve(lines)
 
-    pending = lines['sku_id'].isna()
-    counts['skipped_pending_lines'] = int(pending.sum())
-    counts['skipped_pending_orders'] = int(lines.loc[pending, 'order_no'].nunique())
-    known = lines[~pending]
+    if only is None:
+        pending = lines['sku_id'].isna()
+        counts['skipped_pending_lines'] = int(pending.sum())
+        counts['skipped_pending_orders'] = int(lines.loc[pending, 'order_no'].nunique())
+        known = lines[~pending]
+    else:
+        # same listing key as sku/process.py: (merchant_sku, cleaned seller SKU or '')
+        keys = zip(lines['platform_sku'], lines['seller_sku'].map(lambda s: clean_sku(None if pd.isna(s) else s)))
+        hit = pd.Series([(None if pd.isna(p) else p, '' if pd.isna(c) else c) in only for p, c in keys],
+                        index=lines.index)
+        known = lines[hit]
+        counts['target_lines'], counts['ignored_lines'] = len(known), int((~hit).sum())
+        unresolved = known['sku_id'].isna()
+        if unresolved.any():
+            raise RuntimeError(f'{code}: {int(unresolved.sum())} lines of resolved listings still have no SKU '
+                               f'(e.g. {known.loc[unresolved, "platform_sku"].iloc[0]!r})')
     counts['bundle_lines'] = int(known['is_bundle'].sum())
 
     detail = explode_bundles(known, ms.bom)
@@ -119,7 +192,7 @@ def load_channel(conn, code: str, table: str, run_id: int, channel_id: int, gmv2
     orders = build_orders(lines, detail, gmv2_dedup)
     counts['orders'], counts['detail_rows'] = len(orders), len(detail)
     if orders.empty:
-        _log(conn, run_id, code, counts)
+        _log(conn, run_id, code, counts, step)
         return counts
 
     orders['city_id'] = ensure_cities(conn, orders)
@@ -127,13 +200,17 @@ def load_channel(conn, code: str, table: str, run_id: int, channel_id: int, gmv2
     try:
         with conn.cursor() as cur:
             cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (f'orders:{code}',))
-            order_id = upsert_orders(cur, orders, channel_id, run_id)
+            if only is None:
+                order_id = upsert_orders(cur, orders, channel_id, run_id)
+            else:
+                order_id, new = insert_new_orders(cur, orders, channel_id, run_id)
+                counts['orders_new'], counts['orders_existing'] = new, len(orders) - new
             detail['order_id'] = detail['order_no'].map(order_id)
             drop_stale_lines(cur, detail)
             detail_id = upsert_details(cur, detail, run_id)
             write_dq(cur, detail, detail_id)
             recount(cur, list(order_id.values()))
-            log_step(cur, run_id, next_step_seq(cur, run_id), 'load_orders', code, 't_order_detail',
+            log_step(cur, run_id, next_step_seq(cur, run_id), step, code, 't_order_detail',
                      rows_read=counts['lines'], rows_inserted=counts['detail_rows'],
                      rows_rejected=counts['rejected'], message=json.dumps(counts))
         conn.commit()
@@ -143,9 +220,9 @@ def load_channel(conn, code: str, table: str, run_id: int, channel_id: int, gmv2
     return counts
 
 
-def _log(conn, run_id: int, code: str, counts: dict):
+def _log(conn, run_id: int, code: str, counts: dict, step: str = 'load_orders'):
     with conn.cursor() as cur:
-        log_step(cur, run_id, next_step_seq(cur, run_id), 'load_orders', code, 't_order_detail',
+        log_step(cur, run_id, next_step_seq(cur, run_id), step, code, 't_order_detail',
                  rows_read=counts['lines'], rows_inserted=0, rows_rejected=counts['rejected'],
                  message=json.dumps(counts))
     conn.commit()
@@ -362,9 +439,33 @@ def upsert_orders(cur, orders: pd.DataFrame, channel_id: int, run_id: int) -> di
     """
     ids = {}
     for part in _chunks(orders):
-        cur.execute(sql, [channel_id, *[_values(part[c], k) for c, _, k in ORDER_COLS], run_id])
+        cur.execute(sql, [channel_id, run_id, *[_values(part[c], k) for c, _, k in ORDER_COLS]])
         ids.update(dict(cur.fetchall()))
     return ids
+
+
+def insert_new_orders(cur, orders: pd.DataFrame, channel_id: int, run_id: int) -> tuple[dict, int]:
+    """Headers for orders that have none yet; an existing header is left exactly as it is.
+    Returns order_no -> order_id of every order in `orders` and the number of new headers."""
+    names = [c for c, _, _ in ORDER_COLS]
+    ids, new = {}, 0
+    for part in _chunks(orders):
+        cur.execute(f"""
+            INSERT INTO {SCHEMA}.t_order (channel_id, {', '.join(names)}, etl_run_id)
+            SELECT %s, {', '.join('u.' + c for c in names)}, %s
+            FROM unnest({', '.join(f'%s::{t}[]' for _, t, _ in ORDER_COLS)}) AS u({', '.join(names)})
+            ON CONFLICT (channel_id, order_no) DO NOTHING
+            RETURNING order_no, order_id
+        """, [channel_id, run_id, *[_values(part[c], k) for c, _, k in ORDER_COLS]])
+        inserted = dict(cur.fetchall())
+        new += len(inserted)
+        ids.update(inserted)
+        cur.execute(f"""
+            SELECT order_no, order_id FROM {SCHEMA}.t_order
+            WHERE channel_id = %s AND order_no = ANY(%s::text[])
+        """, (channel_id, _values(part['order_no'], 'str')))
+        ids.update(dict(cur.fetchall()))
+    return ids, new
 
 
 def drop_stale_lines(cur, detail: pd.DataFrame):
