@@ -428,7 +428,12 @@ def create_sku(cur, book: Master, x: Listing) -> int:
 
 def save_match(cur, upload: dict, channel_id: int, x: Listing, candidates: list, status: str,
                resolved_sku_id: int | None, resolved_by: str | None):
-    """One review row per listing key; a PENDING row of an earlier upload is refreshed, not duplicated."""
+    """One review row per listing key, linked to every upload that holds the listing.
+
+    A PENDING row seen again in a later upload is refreshed (candidates, last order) and gets a
+    log_sku_match_upload row for that upload too; its upload_id stays the first upload. So each
+    upload keeps waiting for the listing and gets its own order lines loaded once it is resolved.
+    """
     best = candidates[0] if candidates else None
     values = {
         'run_id': upload['load_run_id'], 'upload_id': upload['upload_id'], 'channel_id': channel_id,
@@ -439,35 +444,80 @@ def save_match(cur, upload: dict, channel_id: int, x: Listing, candidates: list,
         'score': best.score if best else None,
         'candidates': json.dumps([c.as_json() for c in candidates]),
         'status': status, 'resolved_sku_id': resolved_sku_id, 'resolved_by': resolved_by,
+        'resolution': 'auto_created' if status == 'CREATED_NEW' and resolved_by == 'auto' else None,
     }
     cur.execute(f"""
         INSERT INTO {SCHEMA}.log_sku_match AS m (run_id, upload_id, channel_id, merchant_sku, sku_code,
             seller_sku, product_name, variation, first_order_at, last_order_at, order_line_count,
             suggested_sku_id, suggested_name, similarity_score, candidates, status, resolved_sku_id,
-            resolved_by, resolved_at)
+            resolved_by, resolved_at, resolution)
         VALUES (%(run_id)s, %(upload_id)s, %(channel_id)s, %(merchant_sku)s, %(sku_code)s, %(seller_sku)s,
             %(product_name)s, %(variation)s, %(first_order_at)s, %(last_order_at)s, %(lines)s,
             %(suggested_sku_id)s, %(suggested_name)s, %(score)s, %(candidates)s::jsonb, %(status)s,
-            %(resolved_sku_id)s, %(resolved_by)s, CASE WHEN %(resolved_by)s IS NULL THEN NULL ELSE now() END)
+            %(resolved_sku_id)s, %(resolved_by)s, CASE WHEN %(resolved_by)s IS NULL THEN NULL ELSE now() END,
+            %(resolution)s)
         ON CONFLICT (channel_id, merchant_sku, sku_code) WHERE status = 'PENDING' DO UPDATE SET
-            order_line_count = CASE WHEN m.upload_id = EXCLUDED.upload_id THEN EXCLUDED.order_line_count
-                                    ELSE m.order_line_count + EXCLUDED.order_line_count END,
-            run_id = EXCLUDED.run_id, upload_id = EXCLUDED.upload_id,
+            run_id = EXCLUDED.run_id,
             seller_sku = EXCLUDED.seller_sku, product_name = EXCLUDED.product_name, variation = EXCLUDED.variation,
             first_order_at = LEAST(m.first_order_at, EXCLUDED.first_order_at),
             last_order_at = GREATEST(m.last_order_at, EXCLUDED.last_order_at),
             suggested_sku_id = EXCLUDED.suggested_sku_id, suggested_name = EXCLUDED.suggested_name,
             similarity_score = EXCLUDED.similarity_score, candidates = EXCLUDED.candidates
+        RETURNING match_id
     """, values)
+    match_id = cur.fetchone()[0]
+    cur.execute(f"""
+        INSERT INTO {SCHEMA}.log_sku_match_upload (match_id, upload_id, run_id, order_line_count,
+                                                   first_order_at, last_order_at)
+        VALUES (%(match_id)s, %(upload_id)s, %(run_id)s, %(lines)s, %(first_order_at)s, %(last_order_at)s)
+        ON CONFLICT (match_id, upload_id) DO UPDATE SET
+            run_id = EXCLUDED.run_id, order_line_count = EXCLUDED.order_line_count,
+            first_order_at = EXCLUDED.first_order_at, last_order_at = EXCLUDED.last_order_at
+    """, {**values, 'match_id': match_id})
+    # order lines waiting for the listing, over every upload that holds it
+    cur.execute(f"""
+        UPDATE {SCHEMA}.log_sku_match SET order_line_count = (
+            SELECT sum(order_line_count) FROM {SCHEMA}.log_sku_match_upload WHERE match_id = %(id)s)
+        WHERE match_id = %(id)s
+    """, {'id': match_id})
 
 
 def resolve_pending(cur, channel_id: int, x: Listing, sku_id: int):
-    """A listing waiting for review whose seller SKU has since become known is mapped to that SKU."""
+    """A listing waiting for review whose seller SKU has since become known is mapped to that SKU.
+
+    Earlier uploads that hold the listing skipped its order lines; they are left Paused with
+    resume_needed, so a Resume (svc) loads those lines with handle_continue_order_data_{channel}."""
     cur.execute(f"""
         UPDATE {SCHEMA}.log_sku_match
-        SET status = 'MAPPED', resolved_sku_id = %s, resolved_by = 'auto', resolved_at = now()
+        SET status = 'MAPPED', resolved_sku_id = %s, resolved_by = 'auto', resolved_at = now(),
+            resolution = 'auto_mapped'
         WHERE channel_id = %s AND merchant_sku = %s AND sku_code = %s AND status = 'PENDING'
+        RETURNING match_id
     """, (sku_id, channel_id, x.merchant_sku, x.sku_code or ''))
+    match_ids = [r[0] for r in cur.fetchall()]
+    if match_ids:
+        refresh_waiting_uploads(cur, match_ids)
+
+
+def refresh_waiting_uploads(cur, match_ids: list[int]):
+    """Recount sku_review_pending of the uploads holding these listings; a Paused one left with
+    nothing pending is flagged resume_needed (its skipped lines still have to be loaded)."""
+    cur.execute(f"""
+        UPDATE upload_progress u
+        SET meta_data = (coalesce(u.meta_data::jsonb, '{{}}'::jsonb)
+                         || jsonb_build_object('sku_review_pending', p.pending)
+                         || CASE WHEN u.status = 'Paused' AND p.pending = 0
+                                 THEN jsonb_build_object('resume_needed', true) ELSE '{{}}'::jsonb END)::json,
+            updated_at = now()
+        FROM (SELECT mu.upload_id,
+                     count(*) FILTER (WHERE m.status = 'PENDING') AS pending
+              FROM {SCHEMA}.log_sku_match_upload mu
+              JOIN {SCHEMA}.log_sku_match m USING (match_id)
+              WHERE mu.upload_id IN (SELECT upload_id FROM {SCHEMA}.log_sku_match_upload
+                                     WHERE match_id = ANY(%s))
+              GROUP BY mu.upload_id) p
+        WHERE u.upload_id = p.upload_id
+    """, (match_ids,))
 
 
 # ---------------------------------------------------------------- status / dq
