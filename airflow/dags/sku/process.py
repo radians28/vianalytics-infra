@@ -454,7 +454,7 @@ def save_match(cur, upload: dict, channel_id: int, x: Listing, candidates: list,
         VALUES (%(run_id)s, %(upload_id)s, %(channel_id)s, %(merchant_sku)s, %(sku_code)s, %(seller_sku)s,
             %(product_name)s, %(variation)s, %(first_order_at)s, %(last_order_at)s, %(lines)s,
             %(suggested_sku_id)s, %(suggested_name)s, %(score)s, %(candidates)s::jsonb, %(status)s,
-            %(resolved_sku_id)s, %(resolved_by)s, CASE WHEN %(resolved_by)s IS NULL THEN NULL ELSE now() END,
+            %(resolved_sku_id)s, %(resolved_by)s, CASE WHEN %(resolved_by)s::text IS NULL THEN NULL ELSE now() END,
             %(resolution)s)
         ON CONFLICT (channel_id, merchant_sku, sku_code) WHERE status = 'PENDING' DO UPDATE SET
             run_id = EXCLUDED.run_id,
