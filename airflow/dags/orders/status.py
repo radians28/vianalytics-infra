@@ -20,8 +20,8 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from staging.common import SCHEMA
 
 # resolutions whose order lines are loaded by handle_continue_order_data (auto_created ones are
-# loaded by the first order load)
-CONTINUE_RESOLUTIONS = ('manual', 'sibling', 'auto_mapped')
+# loaded by the first order load; rematch_created ones were PENDING then, so their lines wait)
+CONTINUE_RESOLUTIONS = ('manual', 'sibling', 'auto_mapped', 'rematch_created')
 
 
 def finalize(result: dict, conn_id: str = 'vianalytics_db', meta_key: str = 'orders') -> dict:

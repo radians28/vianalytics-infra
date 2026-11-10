@@ -263,6 +263,7 @@ def register(cur, book: Master, source: Source, listings: list[Listing], upload:
             counts.alias_added += 1
             counts.history_added += change_seller_sku(cur, book, platform, x, platform['sku_id'])
             touch_sku(cur, book, platform['sku_id'], x)
+            resolve_pending(cur, channel_id, x, platform['sku_id'])
         elif platform is not None:                                        # both known (or no seller SKU)
             added = 0
             if sku_id is not None:
