@@ -6,7 +6,7 @@ Port of vianalytics-svc/sku_consolidation/common/tx.py (offline step 6), reading
    are rejected
 3. each line is resolved to the SKU master: cleaned seller SKU via m_sku_alias / m_sku_history,
    else the listing (m_platform_sku). Lines that still have no SKU belong to listings waiting in
-   log_sku_match (PENDING); they are skipped here. Once an admin resolves them through the SKU review
+   log_sku_match (PENDING); they are skipped here. Once they are resolved through the SKU review
    API, handle_continue_order_data_{channel} (run_continue) loads ONLY those listings' lines: lines
    already written (including auto CREATED_NEW listings) and existing headers are never rewritten,
    a mixed order's header only gets item_line_count / total_quantity recounted
@@ -33,6 +33,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from orders import normalize as nz
 from orders.config import SOURCES, stg_column_names
+from orders.status import CONTINUE_RESOLUTIONS
 from sku.rules import clean_sku
 from staging.common import BATCH_SIZE, SCHEMA, log_step
 
@@ -56,16 +57,17 @@ def run(upload: dict, conn_id: str = 'vianalytics_db') -> dict:
 
 
 def run_continue(conf: dict, conn_id: str = 'vianalytics_db') -> dict:
-    """handle_continue_order_data_{channel}: load ONLY the order lines of the listings an admin resolved
-    through the SKU review API (log_sku_match rows of conf['match_ids']).
+    """handle_continue_order_data_{channel}: load ONLY the order lines of the upload's listings that
+    were resolved after the first load skipped them: by a person in the SKU review (manual), along
+    with a reviewer's decision on the same seller SKU (sibling), or by a later upload's SKU step
+    (auto_mapped). A review row is shared by every upload holding the listing (log_sku_match_upload).
 
-    Lines the first load already wrote are never touched: auto CREATED_NEW listings, PENDING rows and
-    every other listing of the upload are ignored, and existing order headers are kept as they are
-    (only their item_line_count / total_quantity are recounted)."""
+    conf['match_ids'] narrows the listings (svc sends them); without it every such listing of the
+    upload is loaded. Lines the first load already wrote are never touched: auto_created listings,
+    PENDING rows and every other listing of the upload are ignored, and existing order headers are
+    kept as they are (only their item_line_count / total_quantity are recounted)."""
     upload_id, channel = _check_conf(conf)
     match_ids = sorted({int(i) for i in conf.get('match_ids') or []})
-    if not match_ids:
-        raise ValueError('Missing match_ids in the DAG run conf')
 
     hook = PostgresHook(postgres_conn_id=conn_id)
     results = {}
@@ -73,24 +75,27 @@ def run_continue(conf: dict, conn_id: str = 'vianalytics_db') -> dict:
         run_id, channels = _start(conn, upload_id, channel)
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT match_id, channel_id, merchant_sku, coalesce(sku_code, '') FROM {SCHEMA}.log_sku_match
-                WHERE match_id = ANY(%s::bigint[]) AND upload_id = %s
-                  AND status IN ('MAPPED', 'CREATED_NEW') AND resolved_by IS DISTINCT FROM 'auto'
-            """, (match_ids, upload_id))
+                SELECT m.match_id, m.channel_id, m.merchant_sku, coalesce(m.sku_code, '')
+                FROM {SCHEMA}.log_sku_match m
+                JOIN {SCHEMA}.log_sku_match_upload mu ON mu.match_id = m.match_id AND mu.upload_id = %s
+                WHERE m.status IN ('MAPPED', 'CREATED_NEW') AND m.resolution = ANY(%s)
+                  AND (cardinality(%s::bigint[]) = 0 OR m.match_id = ANY(%s::bigint[]))
+            """, (upload_id, list(CONTINUE_RESOLUTIONS), match_ids, match_ids))
             rows = cur.fetchall()
         conn.commit()
         ignored = sorted(set(match_ids) - {r[0] for r in rows})
         if ignored:
-            log.warning('match ids ignored (not this upload, still PENDING or resolved automatically): %s', ignored)
+            log.warning('match ids ignored (not in this upload, still PENDING or created automatically): %s',
+                        ignored)
         if not rows:
-            raise RuntimeError(f'No manually resolved SKU among match_ids {match_ids} of upload {upload_id}')
+            raise RuntimeError(f'No resolved SKU to load for upload {upload_id} (match_ids {match_ids or "all"})')
         for code, table in SOURCES[channel]:
             channel_id = channels[code][0]
             only = {(m, s) for _, cid, m, s in rows if cid == channel_id}
             if only:
                 results[code] = load_channel(conn, code, table, run_id, *channels[code], only=only)
                 log.info('%s: %s', code, results[code])
-    return {**conf, 'load_run_id': run_id, 'match_ids': match_ids, 'ignored_match_ids': ignored,
+    return {**conf, 'load_run_id': run_id, 'match_ids': sorted(r[0] for r in rows), 'ignored_match_ids': ignored,
             'orders': results}
 
 
