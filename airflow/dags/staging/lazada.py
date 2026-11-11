@@ -38,7 +38,9 @@ REQUIRED_COLUMNS = ('order_number', 'order_item_id', 'seller_sku')
 ID_COLUMNS = ('order_number', 'order_item_id', 'lazada_id')
 ORDER_NUMBER = re.compile(r'\d+')
 # An ID a spreadsheet turned into a number before the CSV was saved: 2.70325E+15
-SCIENTIFIC_ID = re.compile(r'\d+(\.\d+)?E\+?\d+', re.I)
+# A spreadsheet's scientific form: one-digit mantissa, short exponent (2.30114E+13, 1E+15).
+# Real IDs can hold an E between digits (Shopee 240701E8165790), so the form is matched strictly.
+SCIENTIFIC_ID = re.compile(r'\d([.,]\d+)?E[+-]?\d{1,3}', re.I)
 # Excel keeps 15 significant digits, so a numeric ID of 16+ digits (Lazada IDs
 # are 15-16) has lost its last digit even though it is below 2**53, where
 # cell_text's own check starts

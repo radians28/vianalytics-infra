@@ -36,7 +36,9 @@ CHANNEL_CODE = 'SHOPEE'
 ORDER_ID = re.compile(r'\d{6}[0-9A-Z]+')
 # Some order SNs are all digits (23011370177505); a spreadsheet turns those
 # into numbers and a CSV save then writes 2.30114E+13
-SCIENTIFIC_ID = re.compile(r'\d+(\.\d+)?E\+?\d+', re.I)
+# A spreadsheet's scientific form: one-digit mantissa, short exponent (2.30114E+13, 1E+15).
+# Real IDs can hold an E between digits (Shopee 240701E8165790), so the form is matched strictly.
+SCIENTIFIC_ID = re.compile(r'\d([.,]\d+)?E[+-]?\d{1,3}', re.I)
 # Sheet of the order export; other sheets in a re-saved workbook are ignored
 SHEET_NAME = 'orders'
 # Columns that identify the file as a Shopee order export
