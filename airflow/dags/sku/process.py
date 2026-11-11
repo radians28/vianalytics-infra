@@ -263,6 +263,7 @@ def register(cur, book: Master, source: Source, listings: list[Listing], upload:
             counts.alias_added += 1
             counts.history_added += change_seller_sku(cur, book, platform, x, platform['sku_id'])
             touch_sku(cur, book, platform['sku_id'], x)
+            resolve_pending(cur, channel_id, x, platform['sku_id'])
         elif platform is not None:                                        # both known (or no seller SKU)
             added = 0
             if sku_id is not None:
@@ -454,7 +455,7 @@ def save_match(cur, upload: dict, channel_id: int, x: Listing, candidates: list,
         VALUES (%(run_id)s, %(upload_id)s, %(channel_id)s, %(merchant_sku)s, %(sku_code)s, %(seller_sku)s,
             %(product_name)s, %(variation)s, %(first_order_at)s, %(last_order_at)s, %(lines)s,
             %(suggested_sku_id)s, %(suggested_name)s, %(score)s, %(candidates)s::jsonb, %(status)s,
-            %(resolved_sku_id)s, %(resolved_by)s, CASE WHEN %(resolved_by)s IS NULL THEN NULL ELSE now() END,
+            %(resolved_sku_id)s, %(resolved_by)s, CASE WHEN %(resolved_by)s::text IS NULL THEN NULL ELSE now() END,
             %(resolution)s)
         ON CONFLICT (channel_id, merchant_sku, sku_code) WHERE status = 'PENDING' DO UPDATE SET
             run_id = EXCLUDED.run_id,
