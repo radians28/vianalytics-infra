@@ -33,7 +33,9 @@ log = logging.getLogger(__name__)
 TABLES = {'tiktok': 'stg_tiktok', 'tokopedia': 'stg_tokopedia'}
 ORDER_ID = re.compile(r'\d+')
 # An ID a spreadsheet turned into a number before the CSV was saved: 5.82837E+17
-SCIENTIFIC_ID = re.compile(r'\d+(\.\d+)?E\+?\d+', re.I)
+# A spreadsheet's scientific form: one-digit mantissa, short exponent (2.30114E+13, 1E+15).
+# Real IDs can hold an E between digits (Shopee 240701E8165790), so the form is matched strictly.
+SCIENTIFIC_ID = re.compile(r'\d([.,]\d+)?E[+-]?\d{1,3}', re.I)
 # Sheet of the OrderSKUList export; other sheets in a re-saved workbook are ignored
 SHEET_NAME = 'OrderSKUList'
 

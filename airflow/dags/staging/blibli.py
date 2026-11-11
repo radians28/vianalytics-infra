@@ -47,7 +47,9 @@ REQUIRED_COLUMNS = {
 ID_COLUMNS = ('nomor_pesanan', 'nomor_item_pesanan', 'nomor_paket')
 ORDER_ID = re.compile(r'\d+')
 # An ID a spreadsheet turned into a number before the CSV was saved: 1.21882E+10
-SCIENTIFIC_ID = re.compile(r'\d+(\.\d+)?E\+?\d+', re.I)
+# A spreadsheet's scientific form: one-digit mantissa, short exponent (2.30114E+13, 1E+15).
+# Real IDs can hold an E between digits (Shopee 240701E8165790), so the form is matched strictly.
+SCIENTIFIC_ID = re.compile(r'\d([.,]\d+)?E[+-]?\d{1,3}', re.I)
 # First cell of every sheet of the Seller Analytics dashboard download
 DASHBOARD_TITLE = 'blibli seller analytics'
 # Blibli's bulk download stops at this many rows; a file this size is likely cut off
