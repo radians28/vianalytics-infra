@@ -193,20 +193,36 @@ def _originals(df: pd.DataFrame, bundle_sku_id: int, old_bom: list[dict] | None)
     return lines, mismatch
 
 
-def rebuild_bundle(conn, lookups: Lookups, run_id: int, bundle_sku_id: int, old_bom, new_bom) -> dict:
+def _plain(lines: pd.DataFrame) -> pd.DataFrame:
+    """Rebuilt original lines written as they are, not split (no component list to split them with)."""
+    plain = lines.drop(columns=['base']).copy()
+    plain['is_bundle'] = False
+    plain['dq_flag'] = None
+    return plain
+
+
+def rebuild_bundle(conn, lookups: Lookups, run_id: int, bundle_sku_id: int, old_bom, new_bom,
+                   split_ids: set | None = None) -> dict:
+    """Split the stored lines of `bundle_sku_id` again: rebuilt from `old_bom`, split with `new_bom`
+    (an empty `new_bom` keeps the rebuilt lines plain). `split_ids` limits the split rows taken to those
+    order_detail_ids - the ones that were split with `old_bom` (a SKU split moves only some of them)."""
     df = _read_lines(conn, lookups, bundle_sku_id)
+    if split_ids is not None and not df.empty:
+        df = df[~df['is_bundle'].astype(bool) | df['order_detail_id'].isin(split_ids)].reset_index(drop=True)
     counts = {'rows_read': len(df), 'lines_rebuilt': 0, 'lines_mismatch': 0, 'orders_touched': 0, 'detail_rows': 0}
     if df.empty:
         return counts
     lines, mismatch = _originals(df, bundle_sku_id, old_bom)
-    bom = _bom_frame(bundle_sku_id, new_bom)
+    # no components (any more): the rebuilt originals stay plain lines of the SKU (a SKU split or merged
+    # onto a SKU that is not a bundle)
+    bom = _bom_frame(bundle_sku_id, new_bom) if new_bom else None
 
     for channel_id, part in lines.groupby('channel_id'):
         code = lookups.channel.get(int(channel_id), str(channel_id))
         keys = part[['order_id', 'base']].drop_duplicates()
         for start in range(0, len(keys), BATCH_GROUPS):
             batch = part.merge(keys.iloc[start:start + BATCH_GROUPS], on=['order_id', 'base'])
-            detail = explode_bundles(batch.drop(columns=['base']), bom)
+            detail = explode_bundles(batch.drop(columns=['base']), bom) if bom is not None else _plain(batch)
             if abs(pd.to_numeric(detail['gmv_1']).sum() - pd.to_numeric(batch['gmv_1']).sum()) >= 1.0:
                 raise RuntimeError(f'bundle {bundle_sku_id}: gmv_1 changed by the new breakdown')
             detail = detail.sort_values(['order_id', 'line_key'], kind='stable')

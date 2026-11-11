@@ -230,14 +230,19 @@ class Master:
         return self.cur.fetchone()[0]
 
     def matcher(self) -> NameMatcher:
-        """Names of every SKU and listing; rebuilt after this run adds SKUs."""
+        """Names of every SKU and listing; rebuilt after this run adds SKUs. A SKU being merged away
+        (log_sku_change MERGE not DONE) is left out: it is deleted once its order lines have moved."""
         if self._matcher is None:
             self.cur.execute(f"""
+                WITH merging AS (
+                    SELECT source_sku_id FROM {SCHEMA}.log_sku_change
+                    WHERE kind = 'MERGE' AND status IN ('PENDING', 'RUNNING', 'FAILED'))
                 SELECT s.sku_id, s.sku_master_code, s.product_name FROM {SCHEMA}.m_sku s
+                WHERE s.sku_id NOT IN (SELECT source_sku_id FROM merging)
                 UNION ALL
                 SELECT s.sku_id, s.sku_master_code, p.product_name
                 FROM {SCHEMA}.m_platform_sku p JOIN {SCHEMA}.m_sku s USING (sku_id)
-                WHERE p.product_name IS NOT NULL
+                WHERE p.product_name IS NOT NULL AND s.sku_id NOT IN (SELECT source_sku_id FROM merging)
             """)
             self._matcher = NameMatcher(self.cur.fetchall())
         return self._matcher
