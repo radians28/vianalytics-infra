@@ -2,6 +2,7 @@
 
 Copied from vianalytics-svc/sku_consolidation/common/config.py (STG_MAP, PY_TS) so the DAG
 builds t_order / t_order_detail exactly like the offline step 6. Keep both in sync.
+Only here: `zip` / `zip_style` (postal code for m_zipcode, see orders.city.extract_zip).
 """
 
 # upload channel -> (m_channel.channel_code, stg table) loaded by handle_order_dag_{channel}
@@ -33,7 +34,7 @@ _TIKTOK_TOKOPEDIA = dict(
     unit_price='sku_unit_original_price', seller_discount='sku_seller_discount',
     platform_discount='sku_platform_discount', buyer='buyer_username',
     warehouse='warehouse_name', delivery='delivery_option', payment='payment_method',
-    city='regency_and_city', province='province',
+    city='regency_and_city', province='province', zip='zipcode', zip_style='field',   # masked '*****' today
     shipping_fee='original_shipping_fee', order_total='order_amount')
 
 STG_MAP = {
@@ -47,7 +48,7 @@ STG_MAP = {
         unit_price='harga_awal', seller_discount='diskon_dari_penjual',
         platform_discount='diskon_dari_shopee', buyer='username_pembeli',
         warehouse='nama_gudang', delivery='opsi_pengiriman', payment='metode_pembayaran',
-        city='kota_kabupaten', province='provinsi',
+        city='kota_kabupaten', province='provinsi', zip='alamat_pengiriman', zip_style='address',
         shipping_fee='ongkos_kirim_dibayar_oleh_pembeli', order_total='total_pembayaran'),
     'LAZADA': dict(
         money='plain',
@@ -58,7 +59,7 @@ STG_MAP = {
         unit_price='unit_price', seller_discount='seller_discount_total',
         platform_discount='platform_discount_total', buyer='customer_name',
         warehouse='ware_house', delivery='shipping_provider', payment='pay_method',
-        city='shipping_city', province='shipping_address3',
+        city='shipping_city', province='shipping_address3', zip='shipping_post_code', zip_style='field',
         shipping_fee='shipping_fee', order_total='paid_price'),
     'BLIBLI': dict(
         money='dot',
@@ -69,7 +70,8 @@ STG_MAP = {
         unit_price='harga_produk', seller_discount='diskon_produk_ditanggung_seller',
         platform_discount='diskon_produk_ditanggung_blibli', buyer='nama_pelanggan',
         warehouse='lokasi_pengambilan', delivery='nama_logistik', payment=None,
-        city='kota', province='provinsi', shipping_fee=None, order_total='total'),
+        city='kota', province='provinsi', zip='alamat_pengiriman', zip_style='address',
+        shipping_fee=None, order_total='total'),
     'TIKTOK': _TIKTOK_TOKOPEDIA,
     'TOKOPEDIA': _TIKTOK_TOKOPEDIA,
 }
@@ -78,7 +80,7 @@ STG_MAP = {
 COLUMN_KEYS = ('order_no', 'line_key', 'created', 'paid', 'shipped', 'completed', 'status', 'item_status',
                'seller_sku', 'platform_sku', 'product_name', 'variation', 'qty', 'return_qty', 'unit_price',
                'seller_discount', 'platform_discount', 'buyer', 'warehouse', 'delivery', 'payment', 'city',
-               'province', 'shipping_fee', 'order_total')
+               'province', 'zip', 'shipping_fee', 'order_total')
 
 
 def stg_column_names(channel_code: str) -> list[str]:
