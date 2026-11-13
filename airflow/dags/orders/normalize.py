@@ -12,6 +12,7 @@ import logging
 import numpy as np
 import pandas as pd
 
+from orders.city import extract_zip
 from orders.config import PY_TS, STG_MAP
 from sku.rules import FALLBACK_TS, JAKARTA, shopee_listing_key
 
@@ -98,6 +99,8 @@ def normalize(df: pd.DataFrame, channel_code: str) -> pd.DataFrame:
     n['payment_method'] = clean_text(_col(df, m['payment']))
     n['city'] = clean_text(_col(df, m['city']))
     n['province'] = clean_text(_col(df, m['province']))
+    n['zip_code'] = pd.Series([extract_zip(None if pd.isna(v) else v, m['zip_style'])
+                                for v in _col(df, m['zip'])], index=df.index, dtype='string')
     n['shipping_fee'] = money('shipping_fee') if m['shipping_fee'] else np.nan
     n['order_total'] = money('order_total')
     n['source_file'] = df['source_file']

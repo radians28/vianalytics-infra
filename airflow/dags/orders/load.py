@@ -13,7 +13,8 @@ Port of vianalytics-svc/sku_consolidation/common/tx.py (offline step 6), reading
 4. a bundle line (sku_id in m_sku_bundle) becomes one line per component, one level only (a component
    that is a bundle itself stays that bundle SKU): quantity x component qty, gmv_1 and discounts
    split by price_ratio, rounding remainder on the last component, line_key '<key>#<component_seq>'
-5. one header per order with at least one loaded line. Order-level amounts (gmv_2, shipping fee) come
+5. one header per order with at least one loaded line; city_id from the postal code (m_zipcode), else
+   the marketplace wording via m_city_alias (ensure_cities). Order-level amounts (gmv_2, shipping fee) come
    from every line of the order before the bundle breakdown; item_line_count / total_quantity are
    recounted from the order's t_order_detail rows, so a header matches the lines it actually has
 6. upserts on (channel_id, order_no) and (order_id, line_key): ids come from the IDENTITY sequences
@@ -32,6 +33,7 @@ import pandas as pd
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from orders import normalize as nz
+from orders.city import RefCity, Reference, pick_city
 from orders.config import SOURCES, stg_column_names
 from orders.status import CONTINUE_RESOLUTIONS
 from sku.rules import clean_sku
@@ -366,39 +368,87 @@ def build_orders(lines: pd.DataFrame, detail: pd.DataFrame, gmv2_dedup: bool) ->
         'buyer_username': g['buyer'].first(), 'warehouse_name': g['warehouse'].first(),
         'delivery_option': g['delivery_option'].first(), 'payment_method': g['payment_method'].first(),
         'city_name': g['city'].first(), 'province_name': g['province'].first(),
+        'zip_code': g['zip_code'].first(),
         'item_line_count': d.size(), 'total_quantity': d['quantity'].sum(),
         'shipping_fee': amount('shipping_fee'), 'gmv_2': amount('order_total'),
     })
     return o.rename_axis('order_no').reset_index()
 
 
+def load_reference(cur) -> Reference:
+    """The canonical kabupaten/kota (m_city rows with a Kemendagri city_code)."""
+    cur.execute(f"""
+        SELECT city_id, city_code, city_name, city_type, province_code, province_name
+        FROM {SCHEMA}.m_city WHERE city_code IS NOT NULL
+    """)
+    return Reference(RefCity(*r) for r in cur.fetchall())
+
+
 def ensure_cities(conn, orders: pd.DataFrame) -> pd.Series:
-    """city_id per header; new (city, province) pairs go into m_city in their own short transaction."""
+    """city_id per header, in this order:
+    1. the order's postal code in m_zipcode (one kabupaten/kota per code), unless the reference lists the
+       code in several cities and the wording names one of the others (orders.city.pick_city)
+    2. the marketplace wording (city, province) already in m_city_alias
+    3. new wording: orders.city.match() against the canonical m_city rows, saved as a new alias;
+       wording that matches nothing gets its own m_city row (dq_flag 'unresolved') + alias, so it
+       shows up for review instead of failing the load
+    The writes (step 3) run in their own short transaction."""
     city = orders['city_name']
     province = orders['province_name'].fillna('')
+    zips = orders['zip_code'] if 'zip_code' in orders else pd.Series(pd.NA, index=orders.index)
     pairs = sorted({(c, p) for c, p in zip(city, province) if not pd.isna(c)})
-    if not pairs:
-        return pd.Series(pd.NA, index=orders.index, dtype='Int64')
-    names, provinces = [p[0] for p in pairs], [p[1] for p in pairs]
+    zip_list = sorted({z for z in zips if not pd.isna(z)})
     try:
         with conn.cursor() as cur:
-            cur.execute(f"""
-                INSERT INTO {SCHEMA}.m_city (city_name, province_name)
-                SELECT * FROM unnest(%s::text[], %s::text[])
-                ON CONFLICT (city_name, province_name) DO NOTHING
-            """, (names, provinces))
-            cur.execute(f"""
-                SELECT c.city_name, c.province_name, c.city_id
-                FROM {SCHEMA}.m_city c JOIN unnest(%s::text[], %s::text[]) AS k(city_name, province_name)
-                USING (city_name, province_name)
-            """, (names, provinces))
-            ids = {(r[0], r[1]): r[2] for r in cur.fetchall()}
+            cur.execute(f"""SELECT zip_code, city_id, other_city_ids FROM {SCHEMA}.m_zipcode
+                            WHERE zip_code = ANY(%s::text[])""", (zip_list,))
+            by_zip = {z: (cid, other) for z, cid, other in cur.fetchall()}
+            alias = _read_aliases(cur, pairs)
+            new = [p for p in pairs if p not in alias]
+            if new:
+                ref = load_reference(cur)
+                rows = []
+                for c, p in new:
+                    m = ref.match(c, p)
+                    if m.city is None:
+                        cur.execute(f"""
+                            INSERT INTO {SCHEMA}.m_city (city_name, province_name, dq_flag)
+                            VALUES (%s, %s, 'unresolved')
+                            ON CONFLICT (city_name, province_name) DO NOTHING
+                        """, (c, p))
+                        cur.execute(f"SELECT city_id FROM {SCHEMA}.m_city WHERE city_name = %s AND province_name = %s",
+                                    (c, p))
+                        rows.append((c, p, cur.fetchone()[0], 'unresolved', m.flag))
+                    else:
+                        rows.append((c, p, m.city.city_id, m.method, m.flag))
+                cur.execute(f"""
+                    INSERT INTO {SCHEMA}.m_city_alias (raw_city_name, raw_province_name, city_id, match_method, dq_flag)
+                    SELECT * FROM unnest(%s::text[], %s::text[], %s::int[], %s::text[], %s::text[])
+                    ON CONFLICT (raw_city_name, raw_province_name) DO NOTHING
+                """, [list(col) for col in zip(*rows)])
+                unresolved = sum(r[3] == 'unresolved' for r in rows)
+                log.info('m_city_alias: %d new wording(s), %d unresolved', len(rows), unresolved)
+                alias = _read_aliases(cur, pairs)       # another load may have won the insert race
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    return pd.Series([None if pd.isna(c) else ids.get((c, p)) for c, p in zip(city, province)],
-                     index=orders.index, dtype='Int64')
+    out = []
+    for c, p, z in zip(city, province, zips):
+        zip_city, other = by_zip.get(None if pd.isna(z) else z, (None, None))
+        out.append(pick_city(zip_city, other, None if pd.isna(c) else alias.get((c, p))))
+    return pd.Series(out, index=orders.index, dtype='Int64')
+
+
+def _read_aliases(cur, pairs) -> dict:
+    if not pairs:
+        return {}
+    cur.execute(f"""
+        SELECT a.raw_city_name, a.raw_province_name, a.city_id
+        FROM {SCHEMA}.m_city_alias a JOIN unnest(%s::text[], %s::text[]) AS k(raw_city_name, raw_province_name)
+        USING (raw_city_name, raw_province_name)
+    """, ([p[0] for p in pairs], [p[1] for p in pairs]))
+    return {(r[0], r[1]): r[2] for r in cur.fetchall()}
 
 
 # ---------------------------------------------------------------- writes
@@ -427,7 +477,7 @@ ORDER_COLS = [('order_no', 'text', 'str'), ('city_id', 'integer', 'int'), ('orde
               ('buyer_username', 'text', 'str'), ('warehouse_name', 'text', 'str'),
               ('delivery_option', 'text', 'str'), ('payment_method', 'text', 'str'),
               ('item_line_count', 'integer', 'int'), ('total_quantity', 'integer', 'int'),
-              ('shipping_fee', 'numeric', 'num'), ('gmv_2', 'numeric', 'num')]
+              ('shipping_fee', 'numeric', 'num'), ('gmv_2', 'numeric', 'num'), ('zip_code', 'text', 'str')]
 
 
 def upsert_orders(cur, orders: pd.DataFrame, channel_id: int, run_id: int) -> dict:
